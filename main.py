@@ -183,3 +183,62 @@ async def order_status(order_id: str):
     if not order:
         return {"status": "not_found"}
     return {"status": order.get("status"), "pdf_url": order.get("pdf_url"), "docx_url": order.get("docx_url"), "access_code": order.get("access_code")}
+    # Requerido si no está importado aún
+import time
+import threading
+from fastapi import FastAPI, Request
+
+# suponiendo que tu app se llama `app` (si se llama distinto, adapta)
+# app = FastAPI()
+
+def _safe_generate_and_deliver(order_id: str, payer_email: str):
+    """
+    Llamada segura a generate_and_deliver si existe.
+    Si no existe, simulamos el trabajo y escribimos logs.
+    """
+    try:
+        # Si tu proyecto ya define generate_and_deliver, se usará
+        generate_and_deliver  # noqa: F821
+    except Exception:
+        # Si no existe, simulamos tarea
+        print(f"[simulate-paid] generate_and_deliver no existe — simulando para {order_id} / {payer_email}")
+        # Simular tiempo de procesamiento y resultado
+        time.sleep(2)
+        print(f"[simulate-paid] Simulación completada para {order_id} → archivos generados (simulado)")
+        return
+
+    try:
+        # Llama la función real en background
+        generate_and_deliver(order_id, payer_email)
+        print(f"[simulate-paid] generate_and_deliver lanzado para {order_id}")
+    except Exception as e:
+        print(f"[simulate-paid] Error al ejecutar generate_and_deliver: {e}")
+
+@app.post("/simulate-paid")
+async def simulate_paid(request: Request):
+    """
+    Endpoint de testing para simular que un pago fue aprobado.
+    Body esperado (JSON): {"order_id":"ORD-RXTEST-003","payer_email":"cliente@ejemplo.com"}
+    """
+    payload = await request.json()
+    order_id = payload.get("order_id") or f"SIM-{int(time.time())}"
+    payer_email = payload.get("payer_email") or "cliente@ejemplo.com"
+
+    # Si usas una estructura ORDERS en memoria, intenta marcar la orden como pagada
+    try:
+        ORDERS  # noqa: F821
+        try:
+            ORDERS.setdefault(order_id, {})
+            ORDERS[order_id]["status"] = "paid"
+            ORDERS[order_id]["payer_email"] = payer_email
+        except Exception:
+            pass
+    except Exception:
+        # ORDERS no existe: no pasa nada
+        pass
+
+    # Lanzar en background para no bloquear la respuesta HTTP
+    threading.Thread(target=_safe_generate_and_deliver, args=(order_id, payer_email), daemon=True).start()
+
+    return {"ok": True, "simulated": True, "order": order_id, "payer_email": payer_email}
+
