@@ -305,13 +305,14 @@ def save_pdf_from_text(text: str, path: str) -> None:
 
 
 # ---------- Core: generate and deliver ----------
+# --- Reemplaza la función generate_and_deliver por esta versión mejorada ---
 def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
     """
     Genera el examen, guarda DOCX/PDF en /tmp y actualiza ORDERS con los links.
+    Esta versión añade logging extra para depuración.
     """
     print(f"[generate_and_deliver] START order {order_id} for {payer_email}")
     order = ORDERS.get(order_id, {})
-    # Obtener metadata si existiera
     payload = order.get("payload", {}) if isinstance(order, dict) else {}
     subject = payload.get("subject", "Medicina")
     topic = payload.get("topic", "Tema de prueba")
@@ -322,29 +323,70 @@ def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
     order["status"] = "processing"
     ORDERS[order_id] = order
 
-    # 1) generar texto (OpenAI si disponible)
-    exam_text = generate_text_with_openai(subject, topic, mcq_count, essay_count)
+    # Chequeo de librerías disponibles
+    have_openai = (openai is not None) and bool(OPENAI_API_KEY)
+    have_docx = Document is not None
+    have_pdf_lib = canvas is not None
+    print(f"[generate_and_deliver] libs -> openai:{have_openai} python-docx:{have_docx} reportlab:{have_pdf_lib}")
 
-    # 2) guardar DOCX y PDF en /tmp
+    # 1) generar texto (OpenAI si disponible)
+    try:
+        exam_text = generate_text_with_openai(subject, topic, mcq_count, essay_count)
+        print(f"[generate_and_deliver] Generated exam text length: {len(exam_text) if exam_text else 0}")
+    except Exception as e:
+        exam_text = f"Error generando texto: {e}\n\nSe generó texto fallback."
+        print(f"[generate_and_deliver] Error al generar texto: {e}")
+
+    # 2) guardar DOCX y PDF en /tmp (FILES_PATH)
     safe_order = order_id.replace("/", "_")
     docx_path = os.path.join(FILES_PATH, f"{safe_order}.docx")
     pdf_path = os.path.join(FILES_PATH, f"{safe_order}.pdf")
 
-    try:
-        save_docx_from_text(exam_text, docx_path)
-        print(f"[generate_and_deliver] DOCX saved: {docx_path}")
-    except Exception as e:
-        print(f"[generate_and_deliver] Error saving DOCX: {e}")
+    # Guardar DOCX (solo si python-docx presente)
+    if have_docx:
+        try:
+            save_docx_from_text(exam_text, docx_path)
+            print(f"[generate_and_deliver] DOCX saved: {docx_path}")
+        except Exception as e:
+            print(f"[generate_and_deliver] Error saving DOCX: {e}")
+    else:
+        # Crear fallback .docx-free: guardar .txt con nombre .docx para ver contenido
+        try:
+            txt_path = os.path.join(FILES_PATH, f"{safe_order}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(exam_text)
+            # también crear una copia con extensión .docx para que se vea algo
+            with open(docx_path, "w", encoding="utf-8") as f2:
+                f2.write(exam_text)
+            print(f"[generate_and_deliver] python-docx no instalado: se escribió fallback TXT+DOCX at {txt_path} and {docx_path}")
+        except Exception as e:
+            print(f"[generate_and_deliver] Error fallback saving TXT/DOCX: {e}")
 
-    try:
-        save_pdf_from_text(exam_text, pdf_path)
-        print(f"[generate_and_deliver] PDF saved: {pdf_path}")
-    except Exception as e:
-        print(f"[generate_and_deliver] Error saving PDF: {e}")
+    # Guardar PDF (solo si reportlab presente)
+    if have_pdf_lib:
+        try:
+            save_pdf_from_text(exam_text, pdf_path)
+            print(f"[generate_and_deliver] PDF saved: {pdf_path}")
+        except Exception as e:
+            print(f"[generate_and_deliver] Error saving PDF: {e}")
+    else:
+        # Fallback: crear un archivo .txt y también copiarlo con extensión .pdf (no es PDF real,
+        # pero servirá para pruebas. Indicará que falta reportlab.)
+        try:
+            fallback_txt = os.path.join(FILES_PATH, f"{safe_order}_fallback.txt")
+            with open(fallback_txt, "w", encoding="utf-8") as f:
+                f.write("FALLBACK PDF (reportlab no instalado).\n\n" + exam_text)
+            # create a copy named .pdf so StaticFiles can serve something
+            with open(pdf_path, "w", encoding="utf-8") as f2:
+                f2.write("FALLBACK PDF (reportlab no instalado).\n\n" + exam_text)
+            print(f"[generate_and_deliver] reportlab no instalado: se escribió fallback TXT y archivo con extensión .pdf at {fallback_txt} and {pdf_path}")
+        except Exception as e:
+            print(f"[generate_and_deliver] Error fallback saving PDF: {e}")
 
     # 3) actualizar ORDERS con URLs públicas (se sirven via /files)
-    pdf_url = f"{BASE_URL}/files/{os.path.basename(pdf_path)}"
-    docx_url = f"{BASE_URL}/files/{os.path.basename(docx_path)}"
+    base_for_links = BASE_URL if str(BASE_URL).startswith("http") else f"https://{BASE_URL}"
+    pdf_url = f"{base_for_links}/files/{os.path.basename(pdf_path)}"
+    docx_url = f"{base_for_links}/files/{os.path.basename(docx_path)}"
 
     order["pdf_url"] = pdf_url
     order["docx_url"] = docx_url
@@ -352,11 +394,7 @@ def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
     order["delivered_at"] = time.time()
     ORDERS[order_id] = order
 
-    # 4) (Opcional) enviar correo con links: implementa send_email si quieres
-    # send_email(order.get("email"), "Tu examen RedaXion está listo", f"Descarga aquí: {pdf_url}")
-
     print(f"[generate_and_deliver] DONE order {order_id}. Links: {pdf_url} {docx_url}")
-
 
 @app.get("/order-status")
 async def order_status(order_id: str):
@@ -376,23 +414,32 @@ async def order_status(order_id: str):
 if ENABLE_SIMULATE:
     @app.post("/simulate-paid")
     async def simulate_paid(request: Request):
-        """
-        Endpoint de testing para simular que un pago fue aprobado.
-        Habilitar solo temporalmente con ENABLE_SIMULATE=1 en variables de entorno.
-        Body esperado (JSON): {"order_id":"ORD-RXTEST-003","payer_email":"cliente@ejemplo.com"}
-        """
         payload = await request.json()
         order_id = payload.get("order_id") or f"SIM-{int(time.time())}"
         payer_email = payload.get("payer_email") or "cliente@ejemplo.com"
 
-        # marcar orden como pagada en memoria
+        # asegurar order en memoria
         ORDERS.setdefault(order_id, {})
         ORDERS[order_id]["status"] = "paid"
         ORDERS[order_id]["payer_email"] = payer_email
+        ORDERS[order_id]["payment_id"] = f"SIM-{uuid.uuid4().hex[:8]}"
+        ORDERS[order_id]["access_code"] = generate_access_code()
 
         # lanzar generación en background
         threading.Thread(target=_run_generate_with_correct_args, args=(order_id, payer_email), daemon=True).start()
 
         return {"ok": True, "simulated": True, "order": order_id, "payer_email": payer_email}
+
+# --- Endpoint temporal para ver qué archivos hay en /tmp ---
+import os
+@app.get("/debug-list-files")
+async def debug_list_files():
+    try:
+        files = os.listdir(FILES_PATH)
+        ord_files = [f for f in files if f.startswith("ORD-")]
+        return {"ok": True, "FILES_PATH": FILES_PATH, "count": len(ord_files), "files": ord_files}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 # ---------- End of file ----------
