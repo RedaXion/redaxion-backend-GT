@@ -3,7 +3,6 @@ import time
 import uuid
 import threading
 import inspect
-import base64
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -11,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import requests
 
-# Optional AI + document libs
+# Optional AI + document libs (con fallbacks)
 try:
     import openai
 except Exception:
@@ -19,14 +18,20 @@ except Exception:
 
 try:
     from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 except Exception:
     Document = None
+    Pt = None
+    RGBColor = None
+    WD_PARAGRAPH_ALIGNMENT = None
 
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
 except Exception:
     canvas = None
+    letter = None
 
 # ---------- Config (env vars) ----------
 MP_ACCESS_TOKEN = (os.getenv("MP_ACCESS_TOKEN") or "").strip()  # token Mercado Pago (TEST-... or prod)
@@ -43,7 +48,12 @@ if not BASE_URL:
     BASE_URL = "https://TU_DOMINIO_RAILWAY"
 
 if OPENAI_API_KEY and openai:
-    openai.api_key = OPENAI_API_KEY
+    # Si openai está presente, asigna la clave
+    try:
+        openai.api_key = OPENAI_API_KEY
+    except Exception:
+        # Algunas versiones nuevas usan otra inicialización; pero mantenemos esto soportado
+        pass
 
 # ---------- App ----------
 app = FastAPI(title="RedaXion - Backend mínimo (actualizado)")
@@ -61,7 +71,7 @@ FILES_PATH = "/tmp"
 app.mount("/files", StaticFiles(directory=FILES_PATH), name="files")
 
 # ---------- In-memory store ----------
-ORDERS = {}  # order_id -> {email, payload, status, created_at, payment_id, access_code, pdf_url, docx_url}
+ORDERS = {}  # order_id -> {email, payload, status, created_at, payment_id, access_code, exam_pdf_url, ...}
 
 def generate_access_code():
     t = time.strftime("%y%m%d%H%M%S")
@@ -213,82 +223,54 @@ async def mp_webhook(req: Request):
 # ---------- Document generation helpers ----------
 def generate_text_with_openai(subject: str, topic: str, mcq_count: int = 14, essay_count: int = 2) -> str:
     """
-    Prompt maestro: genera TCP + RedaQuiz con formato enriquecido (markdown-like)
-    y cuidado estético. Está pensado para producir texto que luego se convierta
-    a DOCX/PDF con encabezados, negritas e itálicas.
+    Prompt maestro: genera DOS bloques separados por la línea exacta:
+    <<SOLUTIONS>>
+    Bloque A (examen): solo texto en negro, minimalista.
+    Bloque B (solucionario): sólo respuestas y guías de corrección.
     """
     PROMPT = f"""
-Eres RedaXion, un sistema experto en generación de material académico. Tu salida debe estar en ESPAÑOL y cumplir exactamente con las siguientes reglas y formato.
+Eres RedaXion. Produce DOS BLOQUES separados exactamente por la línea:
+<<SOLUTIONS>>
 
-OBJETIVO:
-- Producir una Transcripción Académica Profesional (TCP) + un RedaQuiz (preguntas de alternativa y desarrollo).
-- Basar las afirmaciones clínicas/teóricas en la **mejor evidencia académica disponible**: cuando menciones recomendaciones o afirmaciones, indica la fuerza de la evidencia entre paréntesis: (evidencia fuerte / evidencia moderada / evidencia limitada). No pongas URLs.
+BLOQUE A — EXAMEN (solo esto debe contener el primer bloque):
+Formato requerido (texto plano, todo en negro, sin adornos):
+Asignatura: {subject}
+Tema: {topic}
 
-ESTÉTICA Y MARCADO:
-- Usa un marcado sencillo tipo Markdown para que el documento final quede estético:
-  - Títulos principales: `# Título`
-  - Subtítulos: `## Subtítulo`
-  - Negrita: `**texto en negrita**`
-  - Itálica: `*texto en itálica*`
-  - Listas con `- ` o `1. `
-- Al principio del documento, en el encabezado visible en la primera página (header), incluye exactamente, en **negrita e itálica**:
-  `RedaXion, tecnología que transforma tu estudio`
-  (en el texto de salida, incluye una línea separada marcada así: `<<HEADER: RedaXion, tecnología que transforma tu estudio>>` — el procesador de DOCX deberá convertirla al header).
+Sección "Preguntas de alternativa":
+Genera EXACTAMENTE {mcq_count} preguntas numeradas (1) a ({mcq_count}) con 5 opciones A–E cada una.
+Formato por pregunta:
+1) Enunciado
+A. Opción A
+B. Opción B
+C. Opción C
+D. Opción D
+E. Opción E
 
-ESTRUCTURA DEL DOCUMENTO (orden obligatorio):
-1) `# TCP`
-   - `## Introducción` — breve, contextualiza el tema.
-   - `## Conceptos clave` — bullets con definiciones cortas.
-   - `## Marco teórico y evidencia` — resumen con referencia a la fuerza de la evidencia entre paréntesis.
-   - `## Aplicaciones/práctica` — ejemplos, analogías o caso clínico breve si aplica.
-   - `## Perlas` — 3–5 viñetas con conceptos para recordar.
+Sección "Preguntas de desarrollo":
+Genera EXACTAMENTE {essay_count} preguntas numeradas (p. ej. 1) ...) que pidan respuestas basadas en evidencia (indica en el enunciado: "Responda apoyándose en la mejor evidencia disponible y mencione criterios a evaluar").
 
-2) `# RedaQuiz`
-   - `## Preguntas de alternativa` — EXACTAMENTE {mcq_count} preguntas numeradas:
-     - Formato por pregunta (texto plano con marcado ligero si hace falta):
-       ```
-       1) Enunciado de la pregunta
-       A. Opción A
-       B. Opción B
-       C. Opción C
-       D. Opción D
-       E. Opción E
-       ```
-     - Cada pregunta debe ser de nivel universitario (evaluación aplicada), con distractores plausibles.
+IMPORTANTE:
+- No incluyas el solucionario en este bloque.
+- Todo en texto plano, sin colores, sin encabezados extras, sin logos, sin explicaciones adicionales.
 
-   - `## Preguntas de desarrollo` — EXACTAMENTE {essay_count} preguntas:
-     - Cada enunciado debe incluir contexto y pedir una respuesta apoyada en evidencia; pedir explícitamente criterios a considerar (ej.: "incluya: 1) diagnóstico diferencial, 2) pruebas pertinentes, 3) manejo inicial y 4) evidencia que sustente la decisión").
+Luego escribe la línea:
+<<SOLUTIONS>>
 
-3) Después del bloque de preguntas inserta **15 líneas en blanco** (esto es sagrado).
+BLOQUE B — SOLUCIONARIO (solo esto debe contener el segundo bloque):
+- Para cada pregunta de alternativa, indica: `1) B — Justificación breve (1–2 líneas).`
+- Para cada pregunta de desarrollo, entrega una guía de corrección en 3–5 viñetas (puntos clave que debe contener la respuesta). No más texto.
 
-4) `# Solucionario`
-   - Primero, solucionario para las preguntas de alternativa: para cada número, escribe la LETRA CORRECTA en formato:
-     `1) B — Justificación breve (1–2 líneas).` Indicar por qué los distractores son incorrectos (1 línea).
-   - Luego, guía de corrección para preguntas de desarrollo: por cada pregunta, 3–5 viñetas con los puntos que debe contener la respuesta (incluye referencias a la fuerza de la evidencia entre paréntesis).
-
-OTRAS INSTRUCCIONES:
-- Mantén el lenguaje técnico pero claro.
-- Evita frases vagas; cuando hagas afirmaciones sobre tratamientos/diagnósticos, indica la fuerza de la evidencia entre paréntesis.
-- No incluyas URLs ni citas bibliográficas largas; indicaciones breves sobre la evidencia bastan.
-- La salida final debe ser un bloque de texto único (con el marcado descrito), listo para pasarse a DOCX/PDF.
-- Evita listas excesivamente largas en las preguntas; cada pregunta debe ocupar 4–8 líneas en el enunciado + las opciones.
-
-PARÁMETROS:
-- Materia: {subject}
-- Tema: {topic}
-- MCQ: {mcq_count}
-- Desarrollo: {essay_count}
-
-Genera el documento ahora, siguiendo estrictamente el formato y la estética solicitada.
+No incluyas nada fuera de estos dos bloques. Salida en español.
 """
-    # Llamada a OpenAI (si está disponible)
+    # llamada a OpenAI (ya adaptada a tu versión actual)
     if OPENAI_API_KEY and openai:
         try:
-            print("[generate_text_with_openai] Llamando a OpenAI con Prompt Maestro estético y basado en evidencia...")
+            print("[generate_text_with_openai] Llamando a OpenAI (Prompt final — exam + solutions)...")
             resp = openai.ChatCompletion.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": PROMPT}],
-                temperature=0.15,
+                temperature=0.0,
                 max_tokens=3500
             )
             text = resp["choices"][0]["message"]["content"]
@@ -297,144 +279,90 @@ Genera el documento ahora, siguiendo estrictamente el formato y la estética sol
         except Exception as e:
             print(f"[generate_text_with_openai] OpenAI error: {e}")
 
-    # Fallback si OpenAI no responde
-    fallback = [
-        f"Tema: {topic}",
-        "",
-        "Introducción: (fallback) texto breve.",
-        "",
-        f"Preguntas de alternativa (ejemplo): se generarán {mcq_count} preguntas.",
-        "",
-        "Preguntas de desarrollo (ejemplo):",
-    ]
-    for i in range(1, essay_count + 1):
-        fallback.append(f"{i}. Desarrollo {i}: Respuesta con evidencia (fallback).")
-    fallback.append("")
-    fallback.append("Solucionario: (respuestas de ejemplo)")
-    return "\n".join(fallback)
+    # fallback (muy simple)
+    return f"Asignatura: {subject}\nTema: {topic}\n\nPreguntas de alternativa:\n\n(Contenido fallback)\n\n<<SOLUTIONS>>\n\nSolucionario:\n\n(Contenido fallback)"
 
-from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 def save_docx_from_text(text: str, path: str) -> None:
     """
-    Interpreta un marcado sencillo (basado en lo pedido en el Prompt Maestro)
-    y crea un DOCX con:
-     - Header con: RedaXion, tecnología que transforma tu estudio (negrita + itálica)
-     - Headings (#, ##), negrita ** ** e itálica * *
-     - Listas básicas y párrafos
+    Guardado minimalista: texto negro, con Asignatura/Tema en negrita,
+    numeración de preguntas y opciones tal como vienen en el texto.
     """
     if Document is None:
         raise RuntimeError("python-docx no instalado")
-
     doc = Document()
-    # HEADER: buscar token especial si el prompt lo incluyó
-    # Buscamos la línea marcador: <<HEADER: ... >>
-    header_text = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("<<HEADER:") and line.endswith(">>"):
-            header_text = line.replace("<<HEADER:", "").rstrip(">>").strip()
-            break
+    # aplicar estilo base
+    try:
+        style = doc.styles['Normal']
+        font = style.font
+        if Pt is not None:
+            font.size = Pt(11)
+        font.name = 'Calibri'
+        if RGBColor is not None:
+            font.color.rgb = RGBColor(0x00, 0x00, 0x00)  # negro
+    except Exception:
+        # si falla ajustar estilos, seguimos con defaults
+        pass
 
-    if header_text:
-        section = doc.sections[0]
-        header = section.header
-        ph = header.paragraphs[0]
-        run = ph.add_run(header_text)
-        run.bold = True
-        run.italic = True
-        ph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        ph.style = doc.styles['Normal']
-        # remover la línea del body (no queremos que aparezca dos veces)
-        text = text.replace(f"<<HEADER: {header_text}>>", "")
-
-    # Parse simple markdown-like
     for raw_line in text.split("\n"):
         line = raw_line.rstrip()
         if not line:
-            doc.add_paragraph("")  # blank line
+            doc.add_paragraph("")  # blank
             continue
 
-        # Heading level 1: "# "
-        if line.startswith("# "):
-            p = doc.add_heading(line[2:].strip(), level=1)
-            continue
-        # Heading level 2: "## "
-        if line.startswith("## "):
-            p = doc.add_heading(line[3:].strip(), level=2)
+        # Asignatura: y Tema: en negrita (mantener en una linea)
+        if line.startswith("Asignatura:") or line.startswith("Tema:"):
+            p = doc.add_paragraph()
+            run = p.add_run(line)
+            run.bold = True
             continue
 
-        # Bulleted list (start with "- ")
-        if line.startswith("- "):
-            p = doc.add_paragraph(line[2:].strip(), style='List Bullet')
+        # encabezados simples "Preguntas..." en negrita
+        if line.lower().startswith("preguntas"):
+            p = doc.add_paragraph()
+            run = p.add_run(line)
+            run.bold = True
             continue
 
-        # Numbered list "1. "
-        if line[:3].strip().isdigit() and line[2] == '.':
-            # crude check for "1. "
+        # numbering like "1) " (ej: "1) Enunciado")
+        if len(line) >= 3 and line[:3].strip().isdigit() and line[2] == ')':
             p = doc.add_paragraph(line, style='List Number')
             continue
 
-        # Inline bold **text** and italic *text* handling
-        p = doc.add_paragraph()
-        i = 0
-        while i < len(line):
-            if line[i:i+2] == "**":
-                # bold until next **
-                j = line.find("**", i+2)
-                if j == -1:
-                    run = p.add_run(line[i:])
-                    break
-                run = p.add_run(line[i+2:j])
-                run.bold = True
-                i = j+2
-            elif line[i] == "*" and (i+1 < len(line) and line[i+1] != " "):
-                # italic until next *
-                j = line.find("*", i+1)
-                if j == -1:
-                    run = p.add_run(line[i:])
-                    break
-                run = p.add_run(line[i+1:j])
-                run.italic = True
-                i = j+1
-            else:
-                # normal text until next special
-                # find next special
-                nxt = line.find("**", i)
-                ni = line.find("*", i)
-                if nxt == -1 and ni == -1:
-                    run = p.add_run(line[i:])
-                    break
-                # choose nearest
-                if nxt == -1:
-                    nextpos = ni
-                elif ni == -1:
-                    nextpos = nxt
-                else:
-                    nextpos = min(nxt, ni)
-                run = p.add_run(line[i:nextpos])
-                i = nextpos
+        # opciones "A. " o "A) " o "A. Opción"
+        if len(line) >= 2 and (line[1] == '.' or line[1] == ')') and line[0].isalpha():
+            p = doc.add_paragraph(line)
+            continue
 
-    # Small global styling: set default font size for all paragraphs (improve legibility)
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
+        # default: parrafo normal
+        p = doc.add_paragraph(line)
 
     doc.save(path)
 
 
-
 def save_pdf_from_text(text: str, path: str) -> None:
-    if canvas is None:
-        raise RuntimeError("reportlab no instalado")
+    """
+    Guarda un PDF simple con reportlab si está disponible; si no, crea un archivo de texto fallback
+    y copia su contenido a un archivo con extensión .pdf (no es un PDF real, pero permite descargar).
+    """
+    if canvas is None or letter is None:
+        # fallback: crear txt y también escribir archivo con extensión .pdf para pruebas
+        try:
+            txt_path = path + ".txt"
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            with open(path, "w", encoding="utf-8") as f2:
+                f2.write(text)
+            print(f"[save_pdf_from_text] reportlab no instalado: generado fallback TXT y archivo con extensión .pdf: {path}")
+            return
+        except Exception as e:
+            raise RuntimeError(f"Error fallback saving pdf-like file: {e}")
+
     c = canvas.Canvas(path, pagesize=letter)
     width, height = letter
     margin = 40
     y = height - margin
-    # simple wrap
+    # simple wrap por párrafos
     for paragraph in text.split("\n\n"):
         for l in paragraph.split("\n"):
             l = l.strip()
@@ -458,97 +386,79 @@ def save_pdf_from_text(text: str, path: str) -> None:
     c.save()
 
 
-# ---------- Core: generate and deliver ----------
-# --- Reemplaza la función generate_and_deliver por esta versión mejorada ---
+# ---------- Core: generate and deliver (genera exam y soluciones por separado) ----------
 def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
-    """
-    Genera el examen, guarda DOCX/PDF en /tmp y actualiza ORDERS con los links.
-    Esta versión añade logging extra para depuración.
-    """
     print(f"[generate_and_deliver] START order {order_id} for {payer_email}")
     order = ORDERS.get(order_id, {})
     payload = order.get("payload", {}) if isinstance(order, dict) else {}
-    subject = payload.get("subject", "Medicina")
-    topic = payload.get("topic", "Tema de prueba")
+    subject = payload.get("subject", "Asignatura")
+    topic = payload.get("topic", "Tema")
     mcq_count = int(payload.get("mcqCount", payload.get("mcq_count", 14) or 14))
     essay_count = int(payload.get("essayCount", payload.get("essay_count", 2) or 2))
 
-    # marcar processing
     order["status"] = "processing"
     ORDERS[order_id] = order
 
-    # Chequeo de librerías disponibles
-    have_openai = (openai is not None) and bool(OPENAI_API_KEY)
-    have_docx = Document is not None
-    have_pdf_lib = canvas is not None
-    print(f"[generate_and_deliver] libs -> openai:{have_openai} python-docx:{have_docx} reportlab:{have_pdf_lib}")
+    text = generate_text_with_openai(subject, topic, mcq_count, essay_count)
 
-    # 1) generar texto (OpenAI si disponible)
+    # Separar usando marcador explícito <<SOLUTIONS>>
+    exam_part = None
+    solutions_part = None
+    if "<<SOLUTIONS>>" in text:
+        parts = text.split("<<SOLUTIONS>>", 1)
+        exam_part = parts[0].strip()
+        solutions_part = parts[1].strip()
+    else:
+        # Fallback: intentar buscar "Solucionario" o "Solucionario:"
+        if "Solucionario" in text:
+            idx = text.find("Solucionario")
+            exam_part = text[:idx].strip()
+            solutions_part = text[idx:].strip()
+        else:
+            # si no encontramos, guardamos todo en exam y solutions vacío
+            exam_part = text.strip()
+            solutions_part = "Solucionario no generado (fallback)."
+
+    safe = order_id.replace("/", "_")
+    exam_docx = os.path.join(FILES_PATH, f"{safe}-exam.docx")
+    exam_pdf  = os.path.join(FILES_PATH, f"{safe}-exam.pdf")
+    sol_docx  = os.path.join(FILES_PATH, f"{safe}-solutions.docx")
+    sol_pdf   = os.path.join(FILES_PATH, f"{safe}-solutions.pdf")
+
+    # Guardar archivos (usar save_docx_from_text y save_pdf_from_text)
     try:
-        exam_text = generate_text_with_openai(subject, topic, mcq_count, essay_count)
-        print(f"[generate_and_deliver] Generated exam text length: {len(exam_text) if exam_text else 0}")
+        save_docx_from_text(exam_part, exam_docx)
+        print(f"[generate_and_deliver] Exam DOCX saved: {exam_docx}")
     except Exception as e:
-        exam_text = f"Error generando texto: {e}\n\nSe generó texto fallback."
-        print(f"[generate_and_deliver] Error al generar texto: {e}")
+        print(f"[generate_and_deliver] Error saving exam DOCX: {e}")
+    try:
+        save_docx_from_text(solutions_part, sol_docx)
+        print(f"[generate_and_deliver] Solutions DOCX saved: {sol_docx}")
+    except Exception as e:
+        print(f"[generate_and_deliver] Error saving solutions DOCX: {e}")
 
-    # 2) guardar DOCX y PDF en /tmp (FILES_PATH)
-    safe_order = order_id.replace("/", "_")
-    docx_path = os.path.join(FILES_PATH, f"{safe_order}.docx")
-    pdf_path = os.path.join(FILES_PATH, f"{safe_order}.pdf")
+    try:
+        save_pdf_from_text(exam_part, exam_pdf)
+        print(f"[generate_and_deliver] Exam PDF saved: {exam_pdf}")
+    except Exception as e:
+        print(f"[generate_and_deliver] Error saving exam PDF: {e}")
+    try:
+        save_pdf_from_text(solutions_part, sol_pdf)
+        print(f"[generate_and_deliver] Solutions PDF saved: {sol_pdf}")
+    except Exception as e:
+        print(f"[generate_and_deliver] Error saving solutions PDF: {e}")
 
-    # Guardar DOCX (solo si python-docx presente)
-    if have_docx:
-        try:
-            save_docx_from_text(exam_text, docx_path)
-            print(f"[generate_and_deliver] DOCX saved: {docx_path}")
-        except Exception as e:
-            print(f"[generate_and_deliver] Error saving DOCX: {e}")
-    else:
-        # Crear fallback .docx-free: guardar .txt con nombre .docx para ver contenido
-        try:
-            txt_path = os.path.join(FILES_PATH, f"{safe_order}.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(exam_text)
-            # también crear una copia con extensión .docx para que se vea algo
-            with open(docx_path, "w", encoding="utf-8") as f2:
-                f2.write(exam_text)
-            print(f"[generate_and_deliver] python-docx no instalado: se escribió fallback TXT+DOCX at {txt_path} and {docx_path}")
-        except Exception as e:
-            print(f"[generate_and_deliver] Error fallback saving TXT/DOCX: {e}")
+    base = BASE_URL if str(BASE_URL).startswith("http") else f"https://{BASE_URL}"
+    order["exam_pdf_url"] = f"{base}/files/{os.path.basename(exam_pdf)}"
+    order["exam_docx_url"] = f"{base}/files/{os.path.basename(exam_docx)}"
+    order["solutions_pdf_url"] = f"{base}/files/{os.path.basename(sol_pdf)}"
+    order["solutions_docx_url"] = f"{base}/files/{os.path.basename(sol_docx)}"
 
-    # Guardar PDF (solo si reportlab presente)
-    if have_pdf_lib:
-        try:
-            save_pdf_from_text(exam_text, pdf_path)
-            print(f"[generate_and_deliver] PDF saved: {pdf_path}")
-        except Exception as e:
-            print(f"[generate_and_deliver] Error saving PDF: {e}")
-    else:
-        # Fallback: crear un archivo .txt y también copiarlo con extensión .pdf (no es PDF real,
-        # pero servirá para pruebas. Indicará que falta reportlab.)
-        try:
-            fallback_txt = os.path.join(FILES_PATH, f"{safe_order}_fallback.txt")
-            with open(fallback_txt, "w", encoding="utf-8") as f:
-                f.write("FALLBACK PDF (reportlab no instalado).\n\n" + exam_text)
-            # create a copy named .pdf so StaticFiles can serve something
-            with open(pdf_path, "w", encoding="utf-8") as f2:
-                f2.write("FALLBACK PDF (reportlab no instalado).\n\n" + exam_text)
-            print(f"[generate_and_deliver] reportlab no instalado: se escribió fallback TXT y archivo con extensión .pdf at {fallback_txt} and {pdf_path}")
-        except Exception as e:
-            print(f"[generate_and_deliver] Error fallback saving PDF: {e}")
-
-    # 3) actualizar ORDERS con URLs públicas (se sirven via /files)
-    base_for_links = BASE_URL if str(BASE_URL).startswith("http") else f"https://{BASE_URL}"
-    pdf_url = f"{base_for_links}/files/{os.path.basename(pdf_path)}"
-    docx_url = f"{base_for_links}/files/{os.path.basename(docx_path)}"
-
-    order["pdf_url"] = pdf_url
-    order["docx_url"] = docx_url
     order["status"] = "ready"
     order["delivered_at"] = time.time()
     ORDERS[order_id] = order
+    print(f"[generate_and_deliver] DONE order {order_id}. Exam: {order['exam_pdf_url']} Solutions: {order['solutions_pdf_url']}")
 
-    print(f"[generate_and_deliver] DONE order {order_id}. Links: {pdf_url} {docx_url}")
 
 @app.get("/order-status")
 async def order_status(order_id: str):
@@ -558,8 +468,10 @@ async def order_status(order_id: str):
         return {"status": "not_found"}
     return {
         "status": order.get("status"),
-        "pdf_url": order.get("pdf_url"),
-        "docx_url": order.get("docx_url"),
+        "exam_pdf_url": order.get("exam_pdf_url"),
+        "exam_docx_url": order.get("exam_docx_url"),
+        "solutions_pdf_url": order.get("solutions_pdf_url"),
+        "solutions_docx_url": order.get("solutions_docx_url"),
         "access_code": order.get("access_code"),
         "payment_id": order.get("payment_id"),
     }
