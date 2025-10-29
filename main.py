@@ -213,64 +213,218 @@ async def mp_webhook(req: Request):
 # ---------- Document generation helpers ----------
 def generate_text_with_openai(subject: str, topic: str, mcq_count: int = 14, essay_count: int = 2) -> str:
     """
-    Usa OpenAI si OPENAI_API_KEY está disponible. Si no, genera un texto simple y retornable.
+    Prompt maestro: genera TCP + RedaQuiz con formato enriquecido (markdown-like)
+    y cuidado estético. Está pensado para producir texto que luego se convierta
+    a DOCX/PDF con encabezados, negritas e itálicas.
     """
+    PROMPT = f"""
+Eres RedaXion, un sistema experto en generación de material académico. Tu salida debe estar en ESPAÑOL y cumplir exactamente con las siguientes reglas y formato.
+
+OBJETIVO:
+- Producir una Transcripción Académica Profesional (TCP) + un RedaQuiz (preguntas de alternativa y desarrollo).
+- Basar las afirmaciones clínicas/teóricas en la **mejor evidencia académica disponible**: cuando menciones recomendaciones o afirmaciones, indica la fuerza de la evidencia entre paréntesis: (evidencia fuerte / evidencia moderada / evidencia limitada). No pongas URLs.
+
+ESTÉTICA Y MARCADO:
+- Usa un marcado sencillo tipo Markdown para que el documento final quede estético:
+  - Títulos principales: `# Título`
+  - Subtítulos: `## Subtítulo`
+  - Negrita: `**texto en negrita**`
+  - Itálica: `*texto en itálica*`
+  - Listas con `- ` o `1. `
+- Al principio del documento, en el encabezado visible en la primera página (header), incluye exactamente, en **negrita e itálica**:
+  `RedaXion, tecnología que transforma tu estudio`
+  (en el texto de salida, incluye una línea separada marcada así: `<<HEADER: RedaXion, tecnología que transforma tu estudio>>` — el procesador de DOCX deberá convertirla al header).
+
+ESTRUCTURA DEL DOCUMENTO (orden obligatorio):
+1) `# TCP`
+   - `## Introducción` — breve, contextualiza el tema.
+   - `## Conceptos clave` — bullets con definiciones cortas.
+   - `## Marco teórico y evidencia` — resumen con referencia a la fuerza de la evidencia entre paréntesis.
+   - `## Aplicaciones/práctica` — ejemplos, analogías o caso clínico breve si aplica.
+   - `## Perlas` — 3–5 viñetas con conceptos para recordar.
+
+2) `# RedaQuiz`
+   - `## Preguntas de alternativa` — EXACTAMENTE {mcq_count} preguntas numeradas:
+     - Formato por pregunta (texto plano con marcado ligero si hace falta):
+       ```
+       1) Enunciado de la pregunta
+       A. Opción A
+       B. Opción B
+       C. Opción C
+       D. Opción D
+       E. Opción E
+       ```
+     - Cada pregunta debe ser de nivel universitario (evaluación aplicada), con distractores plausibles.
+
+   - `## Preguntas de desarrollo` — EXACTAMENTE {essay_count} preguntas:
+     - Cada enunciado debe incluir contexto y pedir una respuesta apoyada en evidencia; pedir explícitamente criterios a considerar (ej.: "incluya: 1) diagnóstico diferencial, 2) pruebas pertinentes, 3) manejo inicial y 4) evidencia que sustente la decisión").
+
+3) Después del bloque de preguntas inserta **15 líneas en blanco** (esto es sagrado).
+
+4) `# Solucionario`
+   - Primero, solucionario para las preguntas de alternativa: para cada número, escribe la LETRA CORRECTA en formato:
+     `1) B — Justificación breve (1–2 líneas).` Indicar por qué los distractores son incorrectos (1 línea).
+   - Luego, guía de corrección para preguntas de desarrollo: por cada pregunta, 3–5 viñetas con los puntos que debe contener la respuesta (incluye referencias a la fuerza de la evidencia entre paréntesis).
+
+OTRAS INSTRUCCIONES:
+- Mantén el lenguaje técnico pero claro.
+- Evita frases vagas; cuando hagas afirmaciones sobre tratamientos/diagnósticos, indica la fuerza de la evidencia entre paréntesis.
+- No incluyas URLs ni citas bibliográficas largas; indicaciones breves sobre la evidencia bastan.
+- La salida final debe ser un bloque de texto único (con el marcado descrito), listo para pasarse a DOCX/PDF.
+- Evita listas excesivamente largas en las preguntas; cada pregunta debe ocupar 4–8 líneas en el enunciado + las opciones.
+
+PARÁMETROS:
+- Materia: {subject}
+- Tema: {topic}
+- MCQ: {mcq_count}
+- Desarrollo: {essay_count}
+
+Genera el documento ahora, siguiendo estrictamente el formato y la estética solicitada.
+"""
+    # Llamada a OpenAI (si está disponible)
     if OPENAI_API_KEY and openai:
         try:
-            prompt = f"""
-            Genera un examen académico y su contenido de apoyo en español.
-            Materia: {subject}
-            Tema: {topic}
-            Genera:
-            1) Un texto introductorio tipo libro universitario (breve).
-            2) {mcq_count} preguntas de alternativa (A-E) con una sola correcta.
-            3) {essay_count} preguntas de desarrollo.
-            4) Solucionario al final con respuestas y justificación breve.
-            Formatea con títulos y subtítulos.
-            """
+            print("[generate_text_with_openai] Llamando a OpenAI con Prompt Maestro estético y basado en evidencia...")
             resp = openai.ChatCompletion.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=1600
+                messages=[{"role": "user", "content": PROMPT}],
+                temperature=0.15,
+                max_tokens=3500
             )
             text = resp["choices"][0]["message"]["content"]
+            print(f"[generate_text_with_openai] OpenAI OK — longitud: {len(text)} chars")
             return text
         except Exception as e:
             print(f"[generate_text_with_openai] OpenAI error: {e}")
-            # fallback to simple generator
-    # Fallback simple text
-    parts = [
+
+    # Fallback si OpenAI no responde
+    fallback = [
         f"Tema: {topic}",
         "",
-        "Introducción: Este es un texto de apoyo breve para estudio.",
+        "Introducción: (fallback) texto breve.",
         "",
         f"Preguntas de alternativa (ejemplo): se generarán {mcq_count} preguntas.",
         "",
         "Preguntas de desarrollo (ejemplo):",
     ]
     for i in range(1, essay_count + 1):
-        parts.append(f"{i}. Desarrollo {i}: Escribe una respuesta detallada.")
-    parts.append("")
-    parts.append("Solucionario: (respuestas de ejemplo)")
-    return "\n".join(parts)
+        fallback.append(f"{i}. Desarrollo {i}: Respuesta con evidencia (fallback).")
+    fallback.append("")
+    fallback.append("Solucionario: (respuestas de ejemplo)")
+    return "\n".join(fallback)
 
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 def save_docx_from_text(text: str, path: str) -> None:
+    """
+    Interpreta un marcado sencillo (basado en lo pedido en el Prompt Maestro)
+    y crea un DOCX con:
+     - Header con: RedaXion, tecnología que transforma tu estudio (negrita + itálica)
+     - Headings (#, ##), negrita ** ** e itálica * *
+     - Listas básicas y párrafos
+    """
     if Document is None:
         raise RuntimeError("python-docx no instalado")
+
     doc = Document()
-    for line in text.split("\n"):
+    # HEADER: buscar token especial si el prompt lo incluyó
+    # Buscamos la línea marcador: <<HEADER: ... >>
+    header_text = None
+    for line in text.splitlines():
         line = line.strip()
+        if line.startswith("<<HEADER:") and line.endswith(">>"):
+            header_text = line.replace("<<HEADER:", "").rstrip(">>").strip()
+            break
+
+    if header_text:
+        section = doc.sections[0]
+        header = section.header
+        ph = header.paragraphs[0]
+        run = ph.add_run(header_text)
+        run.bold = True
+        run.italic = True
+        ph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        ph.style = doc.styles['Normal']
+        # remover la línea del body (no queremos que aparezca dos veces)
+        text = text.replace(f"<<HEADER: {header_text}>>", "")
+
+    # Parse simple markdown-like
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip()
         if not line:
             doc.add_paragraph("")  # blank line
             continue
-        # heurística para headings
-        if line.endswith(":") or line.upper() == line and len(line) < 60:
-            doc.add_heading(line, level=2)
-        else:
-            doc.add_paragraph(line)
+
+        # Heading level 1: "# "
+        if line.startswith("# "):
+            p = doc.add_heading(line[2:].strip(), level=1)
+            continue
+        # Heading level 2: "## "
+        if line.startswith("## "):
+            p = doc.add_heading(line[3:].strip(), level=2)
+            continue
+
+        # Bulleted list (start with "- ")
+        if line.startswith("- "):
+            p = doc.add_paragraph(line[2:].strip(), style='List Bullet')
+            continue
+
+        # Numbered list "1. "
+        if line[:3].strip().isdigit() and line[2] == '.':
+            # crude check for "1. "
+            p = doc.add_paragraph(line, style='List Number')
+            continue
+
+        # Inline bold **text** and italic *text* handling
+        p = doc.add_paragraph()
+        i = 0
+        while i < len(line):
+            if line[i:i+2] == "**":
+                # bold until next **
+                j = line.find("**", i+2)
+                if j == -1:
+                    run = p.add_run(line[i:])
+                    break
+                run = p.add_run(line[i+2:j])
+                run.bold = True
+                i = j+2
+            elif line[i] == "*" and (i+1 < len(line) and line[i+1] != " "):
+                # italic until next *
+                j = line.find("*", i+1)
+                if j == -1:
+                    run = p.add_run(line[i:])
+                    break
+                run = p.add_run(line[i+1:j])
+                run.italic = True
+                i = j+1
+            else:
+                # normal text until next special
+                # find next special
+                nxt = line.find("**", i)
+                ni = line.find("*", i)
+                if nxt == -1 and ni == -1:
+                    run = p.add_run(line[i:])
+                    break
+                # choose nearest
+                if nxt == -1:
+                    nextpos = ni
+                elif ni == -1:
+                    nextpos = nxt
+                else:
+                    nextpos = min(nxt, ni)
+                run = p.add_run(line[i:nextpos])
+                i = nextpos
+
+    # Small global styling: set default font size for all paragraphs (improve legibility)
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
+
     doc.save(path)
+
 
 
 def save_pdf_from_text(text: str, path: str) -> None:
