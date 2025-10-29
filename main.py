@@ -29,6 +29,7 @@ except Exception:
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
+    # import simpleSplit later inside function to avoid import error if not present
 except Exception:
     canvas = None
     letter = None
@@ -287,103 +288,138 @@ def save_docx_from_text(text: str, path: str) -> None:
     """
     Guardado minimalista: texto negro, con Asignatura/Tema en negrita,
     numeración de preguntas y opciones tal como vienen en el texto.
+    Si python-docx falla, crea un archivo con la extensión .docx conteniendo el texto (fallback).
     """
-    if Document is None:
-        raise RuntimeError("python-docx no instalado")
-    doc = Document()
-    # aplicar estilo base
     try:
-        style = doc.styles['Normal']
-        font = style.font
-        if Pt is not None:
-            font.size = Pt(11)
-        font.name = 'Calibri'
-        if RGBColor is not None:
-            font.color.rgb = RGBColor(0x00, 0x00, 0x00)  # negro
-    except Exception:
-        # si falla ajustar estilos, seguimos con defaults
-        pass
+        if Document is None:
+            raise RuntimeError("python-docx no instalado")
+        doc = Document()
+        # aplicar estilo base
+        try:
+            style = doc.styles['Normal']
+            font = style.font
+            if Pt is not None:
+                font.size = Pt(11)
+            font.name = 'Calibri'
+        except Exception:
+            pass
 
-    for raw_line in text.split("\n"):
-        line = raw_line.rstrip()
-        if not line:
-            doc.add_paragraph("")  # blank
-            continue
+        for raw_line in text.split("\n"):
+            line = raw_line.rstrip()
+            if not line:
+                doc.add_paragraph("")  # blank
+                continue
 
-        # Asignatura: y Tema: en negrita (mantener en una linea)
-        if line.startswith("Asignatura:") or line.startswith("Tema:"):
-            p = doc.add_paragraph()
-            run = p.add_run(line)
-            run.bold = True
-            continue
+            # Asignatura: y Tema: en negrita (mantener en una linea)
+            if line.startswith("Asignatura:") or line.startswith("Tema:"):
+                p = doc.add_paragraph()
+                run = p.add_run(line)
+                run.bold = True
+                continue
 
-        # encabezados simples "Preguntas..." en negrita
-        if line.lower().startswith("preguntas"):
-            p = doc.add_paragraph()
-            run = p.add_run(line)
-            run.bold = True
-            continue
+            # encabezados simples "Preguntas..." en negrita
+            if line.lower().startswith("preguntas"):
+                p = doc.add_paragraph()
+                run = p.add_run(line)
+                run.bold = True
+                continue
 
-        # numbering like "1) " (ej: "1) Enunciado")
-        if len(line) >= 3 and line[:3].strip().isdigit() and line[2] == ')':
-            p = doc.add_paragraph(line, style='List Number')
-            continue
+            # numbering like "1) " (ej: "1) Enunciado")
+            if len(line) >= 3 and line[:3].strip().isdigit() and line[2] == ')':
+                p = doc.add_paragraph(line, style='List Number')
+                continue
 
-        # opciones "A. " o "A) " o "A. Opción"
-        if len(line) >= 2 and (line[1] == '.' or line[1] == ')') and line[0].isalpha():
+            # opciones "A. " o "A) " o "A. Opción"
+            if len(line) >= 2 and (line[1] == '.' or line[1] == ')') and line[0].isalpha():
+                p = doc.add_paragraph(line)
+                continue
+
+            # default: parrafo normal
             p = doc.add_paragraph(line)
-            continue
 
-        # default: parrafo normal
-        p = doc.add_paragraph(line)
-
-    doc.save(path)
+        # intentar guardar como docx real
+        doc.save(path)
+        print(f"[save_docx_from_text] DOCX guardado: {path}")
+    except Exception as e:
+        # Fallback robusto: crear un .docx "texto" para que siempre haya un archivo descargable
+        try:
+            print(f"[save_docx_from_text] warning: python-docx falló ({e}), creando fallback .docx de texto")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"[save_docx_from_text] Fallback .docx escrito: {path}")
+        except Exception as e2:
+            print(f"[save_docx_from_text] Error escribiendo fallback .docx: {e2}")
+            raise
 
 
 def save_pdf_from_text(text: str, path: str) -> None:
     """
-    Guarda un PDF simple con reportlab si está disponible; si no, crea un archivo de texto fallback
-    y copia su contenido a un archivo con extensión .pdf (no es un PDF real, pero permite descargar).
+    Guarda un PDF con negritas para encabezados usando reportlab si está disponible;
+    si no, crea un archivo de texto con extensión .pdf como fallback.
     """
-    if canvas is None or letter is None:
+    # import simpleSplit lazily (sólo si reportlab está instalado)
+    try:
+        from reportlab.lib.utils import simpleSplit
+    except Exception:
+        simpleSplit = None
+
+    if canvas is None or letter is None or simpleSplit is None:
         # fallback: crear txt y también escribir archivo con extensión .pdf para pruebas
         try:
-            txt_path = path + ".txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
             with open(path, "w", encoding="utf-8") as f2:
                 f2.write(text)
-            print(f"[save_pdf_from_text] reportlab no instalado: generado fallback TXT y archivo con extensión .pdf: {path}")
+            print(f"[save_pdf_from_text] reportlab no instalado o simpleSplit ausente: generado fallback archivo con extensión .pdf: {path}")
             return
         except Exception as e:
             raise RuntimeError(f"Error fallback saving pdf-like file: {e}")
 
     c = canvas.Canvas(path, pagesize=letter)
     width, height = letter
-    margin = 40
+    margin = 50
+    max_width = width - 2 * margin
     y = height - margin
-    # simple wrap por párrafos
-    for paragraph in text.split("\n\n"):
-        for l in paragraph.split("\n"):
-            l = l.strip()
-            if not l:
-                y -= 10
+
+    # Tipos de fuente y tamaños
+    normal_font = "Helvetica"
+    bold_font = "Helvetica-Bold"
+    size_title = 14
+    size_heading = 12
+    size_normal = 11
+    leading = 14  # espacio vertical por línea
+
+    paragraphs = text.split("\n\n")
+    for paragraph in paragraphs:
+        # para cada línea dentro del párrafo
+        for raw_line in paragraph.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                y -= leading // 2
                 continue
-            # naive wrapping at 90 chars
-            while len(l) > 90:
-                if y < margin + 20:
+
+            # Detectar Asignatura / Tema -> título en negrita y tamaño mayor
+            if line.startswith("Asignatura:") or line.startswith("Tema:"):
+                font = bold_font
+                fsize = size_title
+            # encabezados 'Preguntas...' -> negrita heading
+            elif line.lower().startswith("preguntas"):
+                font = bold_font
+                fsize = size_heading
+            else:
+                # numbering lines or options use normal
+                font = normal_font
+                fsize = size_normal
+
+            wrapped = simpleSplit(line, font, fsize, max_width)
+            for wline in wrapped:
+                if y < margin + leading:
                     c.showPage()
                     y = height - margin
-                c.drawString(margin, y, l[:90])
-                l = l[90:]
-                y -= 12
-            if y < margin + 20:
-                c.showPage()
-                y = height - margin
-            c.drawString(margin, y, l)
-            y -= 12
-        y -= 6
+                c.setFont(font, fsize)
+                c.drawString(margin, y, wline)
+                y -= leading
+        y -= leading // 2
     c.save()
+    print(f"[save_pdf_from_text] PDF guardado con estilo: {path}")
 
 
 # ---------- Core: generate and deliver (genera exam y soluciones por separado) ----------
