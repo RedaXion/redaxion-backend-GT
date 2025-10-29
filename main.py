@@ -2,23 +2,51 @@ import os
 import time
 import uuid
 import threading
+import inspect
+import base64
+from typing import Optional
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import requests
 
-# Config desde variables de entorno (configúralas en Railway)
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")  # token Mercado Pago
-BASE_URL = os.getenv("BASE_URL")  # e.j. https://mi-proyecto.railway.app  (IMPORTANTE)
+# Optional AI + document libs
+try:
+    import openai
+except Exception:
+    openai = None
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+except Exception:
+    canvas = None
+
+# ---------- Config (env vars) ----------
+MP_ACCESS_TOKEN = (os.getenv("MP_ACCESS_TOKEN") or "").strip()  # token Mercado Pago (TEST-... or prod)
+BASE_URL = os.getenv("BASE_URL") or ""  # e.g. "https://mi-proyecto.up.railway.app"
 PORT = int(os.getenv("PORT", 8000))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # opcional, para generación de texto con IA
+ENABLE_SIMULATE = os.getenv("ENABLE_SIMULATE", "0") == "1"  # habilita /simulate-paid si "1"
 
 if not MP_ACCESS_TOKEN:
     raise RuntimeError("Por favor configura MP_ACCESS_TOKEN en variables de entorno")
 
 if not BASE_URL:
-    # No se frena, pero te aconsejo configurar BASE_URL en Railway para que el webhook use URL correcta.
-    BASE_URL = "https://TU_DOMINIO_RAILWAY"  # reemplaza si no configuras env var
+    # No se frena, pero es recomendable configurar BASE_URL en Railway.
+    BASE_URL = "https://TU_DOMINIO_RAILWAY"
 
-app = FastAPI(title="RedaXion - Backend minimo")
+if OPENAI_API_KEY and openai:
+    openai.api_key = OPENAI_API_KEY
+
+# ---------- App ----------
+app = FastAPI(title="RedaXion - Backend mínimo (actualizado)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,20 +56,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Store temporal en memoria (simple)
-ORDERS = {}  # order_id -> {email, payload, status, created_at, code}
+# Servir archivos generados desde /tmp vía /files
+FILES_PATH = "/tmp"
+app.mount("/files", StaticFiles(directory=FILES_PATH), name="files")
+
+# ---------- In-memory store ----------
+ORDERS = {}  # order_id -> {email, payload, status, created_at, payment_id, access_code, pdf_url, docx_url}
 
 def generate_access_code():
     t = time.strftime("%y%m%d%H%M%S")
     random = uuid.uuid4().hex[:4].upper()
     return f"RX-{t}-{random}"
 
+# ---------- Helper: call generate_and_deliver with correct args ----------
+def _run_generate_with_correct_args(order_id: str, payer_email: Optional[str]):
+    """
+    Detecta la firma de generate_and_deliver y la invoca con 0/1/2 args según corresponda.
+    """
+    try:
+        fn = generate_and_deliver  # noqa: F821
+    except NameError:
+        print(f"[simulate] generate_and_deliver no definida. Simulación para {order_id}")
+        time.sleep(1)
+        print(f"[simulate] Simulación completada para {order_id}")
+        return
+
+    try:
+        sig = inspect.signature(fn)
+        n_params = len(sig.parameters)
+        print(f"[simulate] generate_and_deliver encontrada con {n_params} param(s). Llamando apropiadamente.")
+        if n_params == 0:
+            fn()
+        elif n_params == 1:
+            fn(order_id)
+        else:
+            fn(order_id, payer_email)
+    except Exception as e:
+        print(f"[simulate] Error al ejecutar generate_and_deliver dinámicamente: {e}")
+
+# ---------- Endpoints ----------
+
 @app.post("/create-preference")
 async def create_preference(req: Request):
     """
     Wix llamará a este endpoint con JSON:
     { order_id, email, subject, topic, bloom, mcqCount, essayCount, includeSolutions }
-    Devuelve: { init_point, preference_id }
+    Devuelve: { init_point, preference_id, order_id }
     """
     data = await req.json()
     order_id = data.get("order_id") or f"ORD-{uuid.uuid4().hex[:8].upper()}"
@@ -81,7 +141,6 @@ async def create_preference(req: Request):
     init_point = pref.get("init_point") or pref.get("sandbox_init_point")
     preference_id = pref.get("id")
 
-    # Guardamos referencia
     ORDERS[order_id]["preference_id"] = preference_id
 
     return {"init_point": init_point, "preference_id": preference_id, "order_id": order_id}
@@ -92,27 +151,36 @@ async def mp_webhook(req: Request):
     """
     Mercado Pago notificará aquí (webhook). Validamos la transacción con la API de MP.
     """
-    body = await req.json()
-    # Mercado Pago suele enviar data.id en body
+    try:
+        body = await req.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    # Extraer payment id (MP envía varias formas)
     payment_id = None
     if isinstance(body, dict):
-        # Manejo varias formas
         if "data" in body and isinstance(body["data"], dict) and "id" in body["data"]:
             payment_id = body["data"]["id"]
         elif "id" in body:
             payment_id = body["id"]
 
     if not payment_id:
+        # No hay payment id: devolver 200 para que MP no vuelva a reenviar
         return {"ok": True, "note": "no payment id"}
 
     # Validar pago con la API de Mercado Pago
-    r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}", headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"})
+    r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                     headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"})
     if r.status_code != 200:
+        # Registrar y responder 200 para evitar reintentos infinitos; el cuerpo incluye detalles
+        print(f"[mp-webhook] validation failed for payment {payment_id}: {r.status_code} {r.text}")
         return {"error": "No se pudo validar pago", "details": r.text}
 
     payment = r.json()
-    if payment.get("status") != "approved":
-        return {"ok": True, "status": payment.get("status")}
+    status = payment.get("status")
+    if status != "approved":
+        print(f"[mp-webhook] payment {payment_id} status: {status}")
+        return {"ok": True, "status": status}
 
     external_ref = payment.get("external_reference") or (payment.get("metadata") or {}).get("order_id")
     payer_email = payment.get("payer", {}).get("email")
@@ -121,10 +189,9 @@ async def mp_webhook(req: Request):
     if not external_ref:
         return {"ok": False, "error": "external_reference missing"}
 
-    # Verificar que el order exista
+    # Obtener o crear order
     order = ORDERS.get(external_ref)
     if not order:
-        # Podemos crear registro si no existe, pero mejor reportarlo
         ORDERS[external_ref] = {"email": payer_email, "payload": {}, "status": "paid", "created_at": time.time()}
         order = ORDERS[external_ref]
 
@@ -137,44 +204,159 @@ async def mp_webhook(req: Request):
     code = generate_access_code()
     order["access_code"] = code
 
-    # Lanzar generación del examen en background (no bloquea el webhook)
-    threading.Thread(target=generate_and_deliver, args=(external_ref,)).start()
+    # Lanzar generación del examen en background (invoca detectando firma)
+    threading.Thread(target=_run_generate_with_correct_args, args=(external_ref, payer_email), daemon=True).start()
 
     return {"ok": True, "order": external_ref, "code": code}
 
 
-def generate_and_deliver(order_id: str):
+# ---------- Document generation helpers ----------
+def generate_text_with_openai(subject: str, topic: str, mcq_count: int = 14, essay_count: int = 2) -> str:
     """
-    Función de ejemplo que se ejecuta en background:
-    - llama a OpenAI (aquí debes implementar la llamada real)
-    - genera DOCX/PDF
-    - sube a storage o guarda en filesystem accesible
-    - envía email con links al cliente
+    Usa OpenAI si OPENAI_API_KEY está disponible. Si no, genera un texto simple y retornable.
     """
-    order = ORDERS.get(order_id)
-    if not order:
-        return
+    if OPENAI_API_KEY and openai:
+        try:
+            prompt = f"""
+            Genera un examen académico y su contenido de apoyo en español.
+            Materia: {subject}
+            Tema: {topic}
+            Genera:
+            1) Un texto introductorio tipo libro universitario (breve).
+            2) {mcq_count} preguntas de alternativa (A-E) con una sola correcta.
+            3) {essay_count} preguntas de desarrollo.
+            4) Solucionario al final con respuestas y justificación breve.
+            Formatea con títulos y subtítulos.
+            """
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1600
+            )
+            text = resp["choices"][0]["message"]["content"]
+            return text
+        except Exception as e:
+            print(f"[generate_text_with_openai] OpenAI error: {e}")
+            # fallback to simple generator
+    # Fallback simple text
+    parts = [
+        f"Tema: {topic}",
+        "",
+        "Introducción: Este es un texto de apoyo breve para estudio.",
+        "",
+        f"Preguntas de alternativa (ejemplo): se generarán {mcq_count} preguntas.",
+        "",
+        "Preguntas de desarrollo (ejemplo):",
+    ]
+    for i in range(1, essay_count + 1):
+        parts.append(f"{i}. Desarrollo {i}: Escribe una respuesta detallada.")
+    parts.append("")
+    parts.append("Solucionario: (respuestas de ejemplo)")
+    return "\n".join(parts)
 
-    # mark processing
+
+def save_docx_from_text(text: str, path: str) -> None:
+    if Document is None:
+        raise RuntimeError("python-docx no instalado")
+    doc = Document()
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            doc.add_paragraph("")  # blank line
+            continue
+        # heurística para headings
+        if line.endswith(":") or line.upper() == line and len(line) < 60:
+            doc.add_heading(line, level=2)
+        else:
+            doc.add_paragraph(line)
+    doc.save(path)
+
+
+def save_pdf_from_text(text: str, path: str) -> None:
+    if canvas is None:
+        raise RuntimeError("reportlab no instalado")
+    c = canvas.Canvas(path, pagesize=letter)
+    width, height = letter
+    margin = 40
+    y = height - margin
+    # simple wrap
+    for paragraph in text.split("\n\n"):
+        for l in paragraph.split("\n"):
+            l = l.strip()
+            if not l:
+                y -= 10
+                continue
+            # naive wrapping at 90 chars
+            while len(l) > 90:
+                if y < margin + 20:
+                    c.showPage()
+                    y = height - margin
+                c.drawString(margin, y, l[:90])
+                l = l[90:]
+                y -= 12
+            if y < margin + 20:
+                c.showPage()
+                y = height - margin
+            c.drawString(margin, y, l)
+            y -= 12
+        y -= 6
+    c.save()
+
+
+# ---------- Core: generate and deliver ----------
+def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
+    """
+    Genera el examen, guarda DOCX/PDF en /tmp y actualiza ORDERS con los links.
+    """
+    print(f"[generate_and_deliver] START order {order_id} for {payer_email}")
+    order = ORDERS.get(order_id, {})
+    # Obtener metadata si existiera
+    payload = order.get("payload", {}) if isinstance(order, dict) else {}
+    subject = payload.get("subject", "Medicina")
+    topic = payload.get("topic", "Tema de prueba")
+    mcq_count = int(payload.get("mcqCount", payload.get("mcq_count", 14) or 14))
+    essay_count = int(payload.get("essayCount", payload.get("essay_count", 2) or 2))
+
+    # marcar processing
     order["status"] = "processing"
+    ORDERS[order_id] = order
 
-    # --- Aquí debes poner la lógica real de generación con OpenAI ---
-    # Por ahora simulamos (espera 5s)
-    time.sleep(5)
+    # 1) generar texto (OpenAI si disponible)
+    exam_text = generate_text_with_openai(subject, topic, mcq_count, essay_count)
 
-    # Simula archivos generados (en tu implementación reemplaza por archivos reales)
-    pdf_url = f"{BASE_URL}/files/{order_id}.pdf"   # ideal: subir a S3/GCS y obtener URL real
-    docx_url = f"{BASE_URL}/files/{order_id}.docx"
+    # 2) guardar DOCX y PDF en /tmp
+    safe_order = order_id.replace("/", "_")
+    docx_path = os.path.join(FILES_PATH, f"{safe_order}.docx")
+    pdf_path = os.path.join(FILES_PATH, f"{safe_order}.pdf")
 
-    # Guardar links en order
+    try:
+        save_docx_from_text(exam_text, docx_path)
+        print(f"[generate_and_deliver] DOCX saved: {docx_path}")
+    except Exception as e:
+        print(f"[generate_and_deliver] Error saving DOCX: {e}")
+
+    try:
+        save_pdf_from_text(exam_text, pdf_path)
+        print(f"[generate_and_deliver] PDF saved: {pdf_path}")
+    except Exception as e:
+        print(f"[generate_and_deliver] Error saving PDF: {e}")
+
+    # 3) actualizar ORDERS con URLs públicas (se sirven via /files)
+    pdf_url = f"{BASE_URL}/files/{os.path.basename(pdf_path)}"
+    docx_url = f"{BASE_URL}/files/{os.path.basename(docx_path)}"
+
     order["pdf_url"] = pdf_url
     order["docx_url"] = docx_url
     order["status"] = "ready"
+    order["delivered_at"] = time.time()
+    ORDERS[order_id] = order
 
-    # Aquí envía un email real usando SendGrid / SMTP con pdf_url y docx_url
-    # send_email(order["email"], "Tu examen RedaXion está listo", f"Descarga aquí: {pdf_url}")
+    # 4) (Opcional) enviar correo con links: implementa send_email si quieres
+    # send_email(order.get("email"), "Tu examen RedaXion está listo", f"Descarga aquí: {pdf_url}")
 
-    print(f"[generate_and_deliver] Order {order_id} listo. Links: {pdf_url} {docx_url}")
+    print(f"[generate_and_deliver] DONE order {order_id}. Links: {pdf_url} {docx_url}")
+
 
 @app.get("/order-status")
 async def order_status(order_id: str):
@@ -182,63 +364,35 @@ async def order_status(order_id: str):
     order = ORDERS.get(order_id)
     if not order:
         return {"status": "not_found"}
-    return {"status": order.get("status"), "pdf_url": order.get("pdf_url"), "docx_url": order.get("docx_url"), "access_code": order.get("access_code")}
-    # Requerido si no está importado aún
-import time
-import threading
-from fastapi import FastAPI, Request
+    return {
+        "status": order.get("status"),
+        "pdf_url": order.get("pdf_url"),
+        "docx_url": order.get("docx_url"),
+        "access_code": order.get("access_code"),
+        "payment_id": order.get("payment_id"),
+    }
 
-# suponiendo que tu app se llama `app` (si se llama distinto, adapta)
-# app = FastAPI()
+# ---------- Optional simulate endpoint (only if ENABLE_SIMULATE=1) ----------
+if ENABLE_SIMULATE:
+    @app.post("/simulate-paid")
+    async def simulate_paid(request: Request):
+        """
+        Endpoint de testing para simular que un pago fue aprobado.
+        Habilitar solo temporalmente con ENABLE_SIMULATE=1 en variables de entorno.
+        Body esperado (JSON): {"order_id":"ORD-RXTEST-003","payer_email":"cliente@ejemplo.com"}
+        """
+        payload = await request.json()
+        order_id = payload.get("order_id") or f"SIM-{int(time.time())}"
+        payer_email = payload.get("payer_email") or "cliente@ejemplo.com"
 
-def _safe_generate_and_deliver(order_id: str, payer_email: str):
-    """
-    Llamada segura a generate_and_deliver si existe.
-    Si no existe, simulamos el trabajo y escribimos logs.
-    """
-    try:
-        # Si tu proyecto ya define generate_and_deliver, se usará
-        generate_and_deliver  # noqa: F821
-    except Exception:
-        # Si no existe, simulamos tarea
-        print(f"[simulate-paid] generate_and_deliver no existe — simulando para {order_id} / {payer_email}")
-        # Simular tiempo de procesamiento y resultado
-        time.sleep(2)
-        print(f"[simulate-paid] Simulación completada para {order_id} → archivos generados (simulado)")
-        return
+        # marcar orden como pagada en memoria
+        ORDERS.setdefault(order_id, {})
+        ORDERS[order_id]["status"] = "paid"
+        ORDERS[order_id]["payer_email"] = payer_email
 
-    try:
-        # Llama la función real en background
-        generate_and_deliver(order_id, payer_email)
-        print(f"[simulate-paid] generate_and_deliver lanzado para {order_id}")
-    except Exception as e:
-        print(f"[simulate-paid] Error al ejecutar generate_and_deliver: {e}")
+        # lanzar generación en background
+        threading.Thread(target=_run_generate_with_correct_args, args=(order_id, payer_email), daemon=True).start()
 
-@app.post("/simulate-paid")
-async def simulate_paid(request: Request):
-    """
-    Endpoint de testing para simular que un pago fue aprobado.
-    Body esperado (JSON): {"order_id":"ORD-RXTEST-003","payer_email":"cliente@ejemplo.com"}
-    """
-    payload = await request.json()
-    order_id = payload.get("order_id") or f"SIM-{int(time.time())}"
-    payer_email = payload.get("payer_email") or "cliente@ejemplo.com"
+        return {"ok": True, "simulated": True, "order": order_id, "payer_email": payer_email}
 
-    # Si usas una estructura ORDERS en memoria, intenta marcar la orden como pagada
-    try:
-        ORDERS  # noqa: F821
-        try:
-            ORDERS.setdefault(order_id, {})
-            ORDERS[order_id]["status"] = "paid"
-            ORDERS[order_id]["payer_email"] = payer_email
-        except Exception:
-            pass
-    except Exception:
-        # ORDERS no existe: no pasa nada
-        pass
-
-    # Lanzar en background para no bloquear la respuesta HTTP
-    threading.Thread(target=_safe_generate_and_deliver, args=(order_id, payer_email), daemon=True).start()
-
-    return {"ok": True, "simulated": True, "order": order_id, "payer_email": payer_email}
-
+# ---------- End of file ----------
