@@ -543,4 +543,13 @@ async def debug_list_files():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# Health-check simple (GET) para /mp-webhook — facilita depuración de webhooks
+from fastapi.responses import JSONResponse
+
+@app.get("/mp-webhook")
+async def mp_webhook_get():
+    # responde 200 para que Mercado Pago marque la URL accesible
+    return JSONResponse({"ok": True, "note": "mp-webhook GET alive"})
+
+
 # ---------- End of file ----------
