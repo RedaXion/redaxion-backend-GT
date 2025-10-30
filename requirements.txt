@@ -12,3 +12,9 @@ redis
 requests
 uvicorn
 fastapi
+google-cloud-storage
+redis
+rq
+python-docx
+reportlab
+
