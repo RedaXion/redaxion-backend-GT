@@ -173,108 +173,158 @@ def _run_generate_with_correct_args(order_id: str, payer_email: Optional[str]):
 
 
 # ---------- Endpoints ----------
+# --- Reemplazar create-preference por esta versión ---
 @app.post("/create-preference")
 async def create_preference(req: Request):
-    """
-    Crea una preference en MP. Acepta en el body:
-    - order_id (opcional)
-    - email (requerido)
-    - items: lista de {id, title, category_id, quantity, unit_price}
-    - payer: {email, first_name, last_name, phone, identification}
-    - device_fingerprint (opcional)
-    """
     data = await req.json()
     order_id = data.get("order_id") or f"ORD-{uuid.uuid4().hex[:8].upper()}"
     email = data.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Falta email")
 
-    # items: toma los que venga o default
-    raw_items = data.get("items") or [{"title": "RedaXion - Generador de examen", "quantity": 1, "unit_price": 2000.0}]
-    items = []
-    for it in raw_items:
-        # asegurar campos mínimos y category_id si viene
-        item = {
-            "title": it.get("title") or "RedaXion item",
-            "quantity": int(it.get("quantity", 1)),
-            "unit_price": float(it.get("unit_price", 0.0)),
-        }
-        if it.get("id"):
-            item["id"] = str(it.get("id"))
-        # category_id si viene (ayuda en la medición)
-        if it.get("category_id"):
-            item["category_id"] = it.get("category_id")
-        items.append(item)
-
-    # payer: incluir identification y phone si vienen
-    payer_raw = data.get("payer") or {"email": email}
-    payer = {"email": payer_raw.get("email", email)}
-    for k in ("first_name", "last_name"):
-        if payer_raw.get(k):
-            payer[k] = payer_raw.get(k)
-    if payer_raw.get("phone"):
-        payer["phone"] = payer_raw.get("phone")
-    if payer_raw.get("identification"):
-        payer["identification"] = payer_raw.get("identification")
-
-    # metadata: dispositivo, ip, user-agent
-    device_fingerprint = data.get("device_fingerprint") or data.get("deviceId") or None
-    client_ip = None
-    try:
-        client_ip = req.client.host
-    except Exception:
-        client_ip = None
-    user_agent = req.headers.get("user-agent")
-
-    metadata = {}
-    if device_fingerprint:
-        metadata["device_fingerprint"] = device_fingerprint
-    if client_ip:
-        metadata["client_ip"] = client_ip
-    if user_agent:
-        metadata["user_agent"] = user_agent
-
-    order = {
-        "email": email,
-        "payload": data,
-        "status": "pending",
-        "created_at": time.time(),
-        "metadata": metadata
-    }
+    order = {"email": email, "payload": data, "status": "pending", "created_at": time.time()}
     persist_order(order_id, order)
 
     preference_payload = {
-        "items": items,
+        "items": data.get("items") or [{"title":"RedaXion - Generador de examen", "quantity":1, "unit_price":2000.0}],
         "external_reference": order_id,
-        "payer": payer,
+        "payer": data.get("payer") or {"email": email},
         "notification_url": f"{BASE_URL}/mp-webhook",
         "back_urls": {
             "success": f"{BASE_URL}/mp-success?order_id={order_id}",
             "failure": f"{BASE_URL}/mp-failure?order_id={order_id}"
         },
-        "auto_return": "approved",
-        # pasar metadata para ayudar en la medición y prevención de fraude
-        "metadata": metadata,
-        "additional_info": data.get("additional_info", "Pago RedaXion")
+        "auto_return": "approved"
     }
 
     headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"}
     resp = requests.post("https://api.mercadopago.com/checkout/preferences", json=preference_payload, headers=headers)
     if resp.status_code not in (200, 201):
-        print(f"[create-preference] MP error: {resp.status_code} {resp.text}")
-        return JSONResponse({"error": "No se pudo crear preference", "details": resp.text}, status_code=500)
+        # guardar respuesta errónea para debug
+        try:
+            with open("/tmp/last_preference_response.json", "w", encoding="utf-8") as f:
+                f.write(json.dumps({"status": resp.status_code, "text": resp.text}))
+        except Exception:
+            pass
+        return {"error": "No se pudo crear preference", "details": resp.text, "status_code": resp.status_code}
 
     pref = resp.json()
-    # prioriza init_point (producción) si existe
+    # Guardar la respuesta completa para debugging (archivo legible)
+    try:
+        with open("/tmp/last_preference.json", "w", encoding="utf-8") as f:
+            f.write(json.dumps(pref))
+    except Exception as e:
+        print(f"[debug] no se pudo escribir last_preference.json: {e}")
+
     init_point = pref.get("init_point") or pref.get("sandbox_init_point")
     preference_id = pref.get("id")
 
-    # guardar referencia en order
     order["preference_id"] = preference_id
-    order["preference_response"] = pref
+    order["preference_payload"] = preference_payload
     persist_order(order_id, order)
 
     return {"init_point": init_point, "sandbox_init_point": pref.get("sandbox_init_point"), "preference_id": preference_id, "order_id": order_id}
+
+# --- Modificar mp_webhook para guardar el body recibido ---
+@app.post("/mp-webhook")
+async def mp_webhook(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        # guardar raw body si json falla
+        raw = await req.body()
+        try:
+            with open("/tmp/last_webhook_raw.txt", "wb") as f:
+                f.write(raw)
+        except Exception:
+            pass
+        return {"ok": False, "error": "invalid json"}
+
+    # Guardar copia del webhook entrante para debug
+    try:
+        with open("/tmp/last_webhook.json", "w", encoding="utf-8") as f:
+            f.write(json.dumps(body))
+    except Exception as e:
+        print(f"[debug] no se pudo escribir last_webhook.json: {e}")
+
+    # (seguir con la lógica existente que ya tienes)
+    payment_id = None
+    if isinstance(body, dict):
+        if "data" in body and isinstance(body["data"], dict) and "id" in body["data"]:
+            payment_id = body["data"]["id"]
+        elif "id" in body:
+            payment_id = body["id"]
+
+    if not payment_id:
+        return {"ok": True, "note": "no payment id"}
+
+    r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                     headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"})
+    if r.status_code != 200:
+        print(f"[mp-webhook] validation failed for payment {payment_id}: {r.status_code} {r.text}")
+        return {"error": "No se pudo validar pago", "details": r.text}
+
+    payment = r.json()
+    status = payment.get("status")
+    if status != "approved":
+        print(f"[mp-webhook] payment {payment_id} status: {status}")
+        return {"ok": True, "status": status}
+
+    external_ref = payment.get("external_reference") or (payment.get("metadata") or {}).get("order_id")
+    payer_email = payment.get("payer", {}).get("email")
+    amount = payment.get("transaction_amount")
+
+    if not external_ref:
+        return {"ok": False, "error": "external_reference missing"}
+
+    order = load_order(external_ref) or {}
+    order["status"] = "paid"
+    order["payment_id"] = payment_id
+    order["amount"] = amount
+    order["payer_email"] = payer_email
+    order["access_code"] = generate_access_code()
+    persist_order(external_ref, order)
+
+    # enqueue/generar...
+    if enqueue_generate_and_deliver:
+        try:
+            jobid = enqueue_generate_and_deliver(external_ref)
+            print(f"[mp-webhook] enqueued job {jobid} for order {external_ref}")
+        except Exception as e:
+            print(f"[mp-webhook] enqueue failed: {e}; falling back to thread")
+            threading.Thread(target=_run_generate_with_correct_args, args=(external_ref, payer_email), daemon=True).start()
+    else:
+        threading.Thread(target=_run_generate_with_correct_args, args=(external_ref, payer_email), daemon=True).start()
+
+    return {"ok": True, "order": external_ref, "code": order["access_code"]}
+
+# --- END PATCH ---
+
+# --- Añade estos endpoints DEBUG al final del archivo para leer lo guardado ---
+@app.get("/debug-last-preference")
+async def debug_last_preference():
+    try:
+        with open("/tmp/last_preference.json", "r", encoding="utf-8") as f:
+            return JSONResponse(content=json.loads(f.read()))
+    except Exception as e:
+        try:
+            with open("/tmp/last_preference_response.json", "r", encoding="utf-8") as f:
+                return JSONResponse(content=json.loads(f.read()))
+        except Exception as e2:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "no last preference file", "e1": str(e), "e2": str(e2)})
+
+@app.get("/debug-last-webhook")
+async def debug_last_webhook():
+    try:
+        with open("/tmp/last_webhook.json", "r", encoding="utf-8") as f:
+            return JSONResponse(content=json.loads(f.read()))
+    except Exception as e:
+        try:
+            with open("/tmp/last_webhook_raw.txt", "rb") as f:
+                raw = f.read().decode('utf-8', errors='replace')
+                return JSONResponse(content={"raw": raw})
+        except Exception as e2:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "no last webhook file", "e1": str(e), "e2": str(e2)})
 
 @app.post("/mp-webhook")
 async def mp_webhook(req: Request):
@@ -621,3 +671,28 @@ async def debug_list_files():
 @app.get("/mp-webhook")
 async def mp_webhook_get():
     return JSONResponse({"ok": True, "note": "mp-webhook GET alive"})
+
+@app.get("/debug-last-preference")
+async def debug_last_preference():
+    try:
+        with open("/tmp/last_preference.json", "r", encoding="utf-8") as f:
+            return JSONResponse(content=json.loads(f.read()))
+    except Exception as e:
+        try:
+            with open("/tmp/last_preference_response.json", "r", encoding="utf-8") as f:
+                return JSONResponse(content=json.loads(f.read()))
+        except Exception as e2:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "no last preference file", "e1": str(e), "e2": str(e2)})
+
+@app.get("/debug-last-webhook")
+async def debug_last_webhook():
+    try:
+        with open("/tmp/last_webhook.json", "r", encoding="utf-8") as f:
+            return JSONResponse(content=json.loads(f.read()))
+    except Exception as e:
+        try:
+            with open("/tmp/last_webhook_raw.txt", "rb") as f:
+                raw = f.read().decode('utf-8', errors='replace')
+                return JSONResponse(content={"raw": raw})
+        except Exception as e2:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "no last webhook file", "e1": str(e), "e2": str(e2)})
