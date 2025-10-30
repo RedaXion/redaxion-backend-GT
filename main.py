@@ -1,4 +1,4 @@
-# main.py (actualizado: guarda/lee orders en Redis)
+# main.py (actualizado: guarda/lee orders en Redis, tolerante a kwargs de RQ)
 import os
 import time
 import uuid
@@ -140,7 +140,7 @@ except Exception:
     enqueue_generate_and_deliver = None
     print("[startup] tasks.enqueue_generate_and_deliver not available; will fallback to thread execution.")
 
-# Helper: dynamic call
+# Helper: dynamic call (used when fallback a thread)
 def _run_generate_with_correct_args(order_id: str, payer_email: Optional[str]):
     try:
         fn = generate_and_deliver  # noqa: F821
@@ -149,17 +149,28 @@ def _run_generate_with_correct_args(order_id: str, payer_email: Optional[str]):
         time.sleep(1)
         print(f"[simulate] Simulación completada para {order_id}")
         return
+
+    # Intento robusto: preferimos (order_id, payer_email), luego (order_id), luego ()
     try:
-        sig = inspect.signature(fn)
-        n_params = len(sig.parameters)
-        if n_params == 0:
-            fn()
-        elif n_params == 1:
-            fn(order_id)
-        else:
-            fn(order_id, payer_email)
+        fn(order_id, payer_email)
+        return
+    except TypeError as e:
+        print(f"[runner] llamada con (order_id, payer_email) falló ({e}), intentando alternativas...")
+
+    try:
+        fn(order_id)
+        return
+    except TypeError as e:
+        print(f"[runner] llamada con (order_id) falló ({e}), intentando llamar sin args...")
+
+    try:
+        fn()
+        return
     except Exception as e:
-        print(f"[simulate] Error al ejecutar generate_and_deliver dinámicamente: {e}")
+        print(f"[runner] llamada sin args falló: {e}")
+
+    print(f"[runner] No se pudo invocar generate_and_deliver para {order_id}.")
+
 
 # ---------- Endpoints ----------
 @app.post("/create-preference")
@@ -377,14 +388,34 @@ def upload_to_gcs(local_path: str, dest_name: str) -> Optional[str]:
         print(f"[gcs] upload error: {e}")
         return None
 
-def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
-    print(f"[generate_and_deliver] START order {order_id} for {payer_email}")
+# ---------- Core: generate and deliver (ahora tolerante a kwargs extra) ----------
+def generate_and_deliver(order_id: Optional[str] = None, payer_email: Optional[str] = None, *args, **kwargs):
+    """
+    Acepta kwargs/args extra que RQ pueda pasar (p.ej. enqueue_timeout).
+    """
+    # Si order_id vino por kwargs (posible en algunos env), úsalo.
+    if not order_id and isinstance(kwargs.get("order_id"), str):
+        order_id = kwargs.get("order_id")
+
+    print(f"[generate_and_deliver] START order {order_id} for {payer_email} (extra_args={len(args)}, extra_kwargs={list(kwargs.keys())})")
+
+    if not order_id:
+        print("[generate_and_deliver] ERROR: order_id no especificado. Abortando.")
+        return
+
     order = load_order(order_id) or {}
     payload = order.get("payload", {}) if isinstance(order, dict) else {}
     subject = payload.get("subject", "Asignatura")
     topic = payload.get("topic", "Tema")
-    mcq_count = int(payload.get("mcqCount", payload.get("mcq_count", 14) or 14))
-    essay_count = int(payload.get("essayCount", payload.get("essay_count", 2) or 2))
+
+    try:
+        mcq_count = int(payload.get("mcqCount", payload.get("mcq_count", 14) or 14))
+    except Exception:
+        mcq_count = 14
+    try:
+        essay_count = int(payload.get("essayCount", payload.get("essay_count", 2) or 2))
+    except Exception:
+        essay_count = 2
 
     order["status"] = "processing"
     persist_order(order_id, order)
@@ -414,10 +445,23 @@ def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
         print(f"[generate_and_deliver] file save error: {e}")
 
     # upload to GCS if available and create final URLs
-    exam_url = upload_to_gcs(exam_pdf, os.path.basename(exam_pdf)) or f"{BASE_URL}/files/{os.path.basename(exam_pdf)}"
-    sol_url  = upload_to_gcs(sol_pdf, os.path.basename(sol_pdf)) or f"{BASE_URL}/files/{os.path.basename(sol_pdf)}"
-    docx_exam_url = upload_to_gcs(exam_docx, os.path.basename(exam_docx)) or f"{BASE_URL}/files/{os.path.basename(exam_docx)}"
-    docx_sol_url  = upload_to_gcs(sol_docx, os.path.basename(sol_docx)) or f"{BASE_URL}/files/{os.path.basename(sol_docx)}"
+    try:
+        exam_url = upload_to_gcs(exam_pdf, os.path.basename(exam_pdf)) or f"{BASE_URL}/files/{os.path.basename(exam_pdf)}"
+    except Exception:
+        exam_url = f"{BASE_URL}/files/{os.path.basename(exam_pdf)}"
+    try:
+        sol_url  = upload_to_gcs(sol_pdf, os.path.basename(sol_pdf)) or f"{BASE_URL}/files/{os.path.basename(sol_pdf)}"
+    except Exception:
+        sol_url = f"{BASE_URL}/files/{os.path.basename(sol_pdf)}"
+
+    try:
+        docx_exam_url = upload_to_gcs(exam_docx, os.path.basename(exam_docx)) or f"{BASE_URL}/files/{os.path.basename(exam_docx)}"
+    except Exception:
+        docx_exam_url = f"{BASE_URL}/files/{os.path.basename(exam_docx)}"
+    try:
+        docx_sol_url  = upload_to_gcs(sol_docx, os.path.basename(sol_docx)) or f"{BASE_URL}/files/{os.path.basename(sol_docx)}"
+    except Exception:
+        docx_sol_url = f"{BASE_URL}/files/{os.path.basename(sol_docx)}"
 
     order["exam_pdf_url"] = exam_url
     order["exam_docx_url"] = docx_exam_url
