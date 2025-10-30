@@ -345,7 +345,7 @@ def save_pdf_from_text(text: str, path: str) -> None:
     c.save()
     print(f"[save_pdf_from_text] PDF guardado con estilo: {path}")
 
-def generate_and_deliver(order_id: str, payer_email: Optional[str] = None):
+def generate_and_deliver(order_id: str, payer_email: Optional[str] = None, **kwargs):
     print(f"[generate_and_deliver] START order {order_id} for {payer_email}")
     order = ORDERS.get(order_id, {})
     payload = order.get("payload", {}) if isinstance(order, dict) else {}
