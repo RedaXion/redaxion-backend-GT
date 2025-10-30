@@ -17,4 +17,13 @@ redis
 rq
 python-docx
 reportlab
-
+fastapi
+uvicorn
+requests
+python-docx
+reportlab
+redis
+rq
+google-cloud-storage
+google-auth
+openai
